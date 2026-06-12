@@ -1,0 +1,98 @@
+# ============================================================
+# 昆仑系统 (Kunlun) · API 配额与令牌桶策略配置
+# 文件: config/rate_limit_policy.yaml
+# ============================================================
+# 依据币安官方 API 文档限频规则制定，适用于 VIP 等级账户
+# 所有时间单位均为毫秒，速率单位遵从币安权重体系
+# ============================================================
+
+rate_limit:
+  # --- 全局请求权重桶 ---
+  requests:
+    # 每分钟总权重上限 (根据账户实际等级调整)
+    weight_limit_per_minute: 1200
+    # 令牌补充速率 (权重/秒)
+    refill_rate_per_second: 20.0
+    # 突发容量倍数 (允许短时超过平均速率)
+    burst_multiplier: 1.2
+    # 令牌桶初始容量 (启动时填满)
+    initial_tokens: 1200
+
+  # --- 订单操作速率限制 ---
+  orders:
+    # 每 10 秒最大订单数 (含所有类型: 限价/市价/止损)
+    max_orders_per_10s: 50
+    # 每秒最大订单数 (用于细粒度控制)
+    max_orders_per_second: 5
+    # 订单令牌补充间隔 (毫秒)
+    refill_interval_ms: 200
+    # 突发大小 (允许连续发送的最大订单数)
+    burst_size: 10
+
+  # --- WebSocket 连接限制 ---
+  websocket:
+    # 每 5 分钟最大新建连接数
+    max_connections_per_5min: 5
+    # 单个 IP 最大并发连接数
+    max_concurrent_connections: 3
+    # 连接失败重试指数退避基数 (毫秒)
+    retry_base_ms: 1000
+    # 最大退避时间 (毫秒)
+    retry_max_ms: 120000
+
+# --- 请求优先级定义 ---
+# 数字越小优先级越高，高优先级可抢占低优先级令牌
+priority:
+  levels:
+    - name: CRITICAL
+      value: 0
+      description: 撤单、止损、紧急平仓
+      preemptive: true
+    - name: HIGH
+      value: 1
+      description: 新开仓、加仓信号
+      preemptive: false
+    - name: MEDIUM
+      value: 2
+      description: 持仓查询、订单状态同步
+      preemptive: false
+    - name: LOW
+      value: 3
+      description: 历史数据查询、非关键 REST 请求
+      preemptive: false
+
+# --- 令牌消耗权重 (参考币安 API 权重表) ---
+weight_table:
+  # 订单相关
+  place_order: 1
+  cancel_order: 1
+  query_order: 1
+  open_orders: 3
+  all_orders: 10
+  # 行情相关
+  order_book_depth_20: 2
+  order_book_depth_100: 5
+  recent_trades: 1
+  kline_data: 1
+  # 账户相关
+  account_info: 10
+  trade_list: 10
+
+# --- 降级与保护 ---
+degradation:
+  # 令牌桶剩余比例触发降级
+  warning_threshold: 0.3    # 低于 30% 时发出警告，降低非关键查询频率
+  critical_threshold: 0.1   # 低于 10% 时仅允许 CRITICAL 级别请求
+  # 限频封禁保护
+  ban_cooldown_seconds: 60  # 若收到 HTTP 429 或 WebSocket 断开，冷却时间
+  max_retries_on_429: 3     # 遇到 429 后重试次数
+  # 错误退避
+  error_backoff_base_ms: 500
+  error_backoff_multiplier: 2.0
+  error_backoff_max_ms: 10000
+
+# --- 监控与日志 ---
+monitoring:
+  log_interval_seconds: 60      # 定期输出令牌使用情况
+  alert_on_token_drop: true    # 令牌快速消耗时发送告警
+  alert_threshold_percent: 20  # 每分钟消耗超过 20% 时告警
