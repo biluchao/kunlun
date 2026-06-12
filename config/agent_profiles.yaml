@@ -1,0 +1,214 @@
+# =============================================================================
+# 昆仑系统 (Kunlun) · 五大智能体配置文件
+# 文件: config/agent_profiles.yaml
+# 描述: 定义 Stone, Wind, Mirror, Eye, Book 五神兽的全部可调参数
+# =============================================================================
+
+agents:
+  # ---------------------------------------------------------------------------
+  # 石·泰山 (Stone Guardian) —— 保守主义守护者
+  # 世界观: "市场永远在酝酿陷阱，生存优先"
+  # ---------------------------------------------------------------------------
+  stone:
+    enabled: true
+    description: "保守主义守护者，负责否决高风险开仓、强制减仓、控制回撤"
+
+    # 恐惧指数 (Fear Index) 构成权重
+    fear_index:
+      drawdown_weight: 0.4          # 近期回撤贡献度 (0-1)
+      consecutive_loss_weight: 0.3   # 连续亏损次数贡献度
+      volatility_weight: 0.3        # 当前市场波动率分位贡献度
+      ema_smoothing: 0.3            # 指数平滑系数 (0-1, 越小越保守)
+      update_interval_seconds: 60   # 更新间隔
+
+      # 恐惧等级阈值
+      thresholds:
+        calm: 0.30       # 冷静，不干预
+        cautious: 0.50   # 谨慎，减仓30%
+        fearful: 0.70    # 恐惧，禁止新开仓
+        terrified: 0.85  # 极度恐惧，减仓50% + 全部禁止
+
+    # 否决权配置
+    veto_power:
+      calm: "no_veto"              # 无否决
+      cautious: "reduce_position_30pct"  # 主动平掉30%仓位
+      fearful: "block_new_entries"       # 阻止新开仓，可平仓
+      terrified: "reduce_50pct_block_all" # 减仓50%并阻止一切
+
+    # 自适应参数 (极度缓慢，防止过拟合)
+    adaptation:
+      rate: 0.01                 # 学习率 (每次调整幅度)
+      min_good_trades_to_relax: 50   # 需要50笔盈利交易才会降低恐惧基线
+      decay_factor: 0.999        # 每次成功后的基线衰减系数
+
+    # 极端行情强制钳制
+    drawdown_lock:
+      max_drawdown_threshold: 0.10   # 系统回撤超过10%触发
+      hunger_cap: 0.20               # 强制饥渴度上限
+
+  # ---------------------------------------------------------------------------
+  # 风·扶摇 (Wind Seeker) —— 激进探索者
+  # 世界观: "机会在怀疑中诞生，波动是朋友"
+  # ---------------------------------------------------------------------------
+  wind:
+    enabled: true
+    description: "在信号稀缺时发起试探性小仓位，防止系统僵化"
+
+    # 探索信号生成规则
+    exploration:
+      trigger_no_signal_seconds: 1200   # 无信号超过20分钟触发探索
+      factor_threshold_relaxation: 0.20 # 因子阈值临时降低20%
+      position_ratio: 0.20              # 仓位为正常时的20%
+      max_exploration_total: 0.05       # 探索仓位不超过总敞口的5%
+      cooldown_seconds: 600            # 探索后冷却10分钟
+
+    # 勇气计数器 (Courage Counter)
+    courage:
+      initial_value: 10
+      gain_per_profitable_trade: 1
+      loss_per_losing_trade: -2
+      max_value: 20
+      min_value: 0
+      # 勇气值 -> 仓位系数映射
+      position_multiplier_map:
+        0: 0.05
+        10: 0.20
+        20: 0.50
+
+    # 冲突解决
+    conflict_resolution: "stone_veto_always_wins"  # 石的否决永远优先
+
+  # ---------------------------------------------------------------------------
+  # 镜·水月 (Mirror Auditor) —— 现实检验者
+  # 世界观: "模型总是错的，必须不断用实盘校正"
+  # ---------------------------------------------------------------------------
+  mirror:
+    enabled: true
+    description: "持续对比虚拟与真实环境，校准滑点模型，修正因子权重"
+
+    # 现实差距检测
+    reality_gap:
+      metrics: ["slippage", "fill_rate", "latency"]
+      alert_threshold: 0.10           # 偏差>10%告警
+      critical_threshold: 0.20        # >20%触发强制重校准
+      evaluation_window: 50           # 最近50笔交易
+      force_evaluation_seconds: 14400  # 每4小时强制评估一次
+
+    # 在线滑点模型校准
+    calibration:
+      method: "online_sgd"
+      learning_rate: 0.005
+      batch_size: 10
+      gradient_clip_norm: 1.0
+      parameters_to_update: ["eta", "gamma", "delta"]
+
+    # 因子权重修正
+    factor_reweighting:
+      check_interval_trades: 100       # 每100笔交易评估
+      min_improvement: 0.05           # 需要5%改进才生效
+      max_single_adjustment: 0.10     # 单次最多调整10%权重
+      ic_threshold_weak: 0.02         # Rank IC低于此值标记为弱因子
+      weak_factor_weight_mult: 0.3    # 弱因子权重降为原来的30%
+
+    # 策略失效检测
+    strategy_decay:
+      sharpe_ratio_historical: 1.5     # 回测夏普
+      decay_threshold: 0.5            # 实盘夏普低于回测50%视为失效
+      monitoring_window_days: 60
+
+  # ---------------------------------------------------------------------------
+  # 眼·千里 (Eye Sentinel) —— 全局观察者
+  # 世界观: "所有市场都是联动的，结构重于信号"
+  # ---------------------------------------------------------------------------
+  eye:
+    enabled: true
+    description: "监控跨市场相关性，检测传染风险，质疑HMM状态"
+
+    # 相关性矩阵配置
+    correlation:
+      crypto_assets: ["BTC", "ETH", "SOL", "BNB"]
+      traditional_assets: ["SPX", "GLD", "DXY"]
+      calculation_window: 100          # K线数量
+      update_interval_seconds: 60
+      alert_threshold: 0.7            # 相关性>0.7视为强联动
+
+    # 跨市场风险响应
+    cross_market_risk:
+      btc_crash_threshold: 0.03       # BTC 3%闪崩
+      reduce_exposure_percent: 0.50   # 相关资产减仓50%
+      reaction_time_ms: 100           # 100ms内响应
+      min_correlation_for_contagion: 0.5
+
+    # 状态质疑 (State Challenge)
+    state_challenge:
+      max_confidence_reduction: 0.3    # 最多降低HMM置信度30%
+      require_cross_confirm: true
+      confirm_assets: ["BTC", "ETH"]   # 需这些资产走势确认
+
+  # ---------------------------------------------------------------------------
+  # 书·春秋 (Book Chronicler) —— 历史学家
+  # 世界观: "过去虽不重复，但韵律永存"
+  # ---------------------------------------------------------------------------
+  book:
+    enabled: true
+    description: "维护情景记忆库，检索历史相似时期，提供决策参考"
+
+    # 情景记忆库
+    memory:
+      clustering_method: "kmeans"
+      n_clusters: 20
+      features:
+        - "volatility_percentile"
+        - "volume_zscore"
+        - "hmm_state"
+        - "obi"
+        - "f1_f3_mean"
+      max_memories: 10000
+      retention_days: 365
+      similarity_metric: "euclidean"
+
+    # 相似情景检索
+    retrieval:
+      top_k: 5
+      min_similarity: 0.6
+      weight_by_recency: true
+      recency_decay: 0.95              # 每天衰减5%
+
+    # 建议生成规则
+    recommendation:
+      min_win_rate_for_confidence: 0.45
+      confidence_mapping:
+        high: "win_rate > 0.60"
+        medium: "win_rate 0.45-0.60"
+        low: "win_rate < 0.45"
+      action_if_low_confidence: "reduce_position_50pct"
+
+    # 自省报告
+    introspection:
+      generate_daily: true
+      generate_weekly: true
+      sections:
+        - "worst_scenarios"
+        - "best_scenarios"
+        - "state_transition_patterns"
+        - "factor_effectiveness_ranking"
+
+# =============================================================================
+# 全局智能体交互规则
+# =============================================================================
+arbitration:
+  # 仲裁模式
+  default_mode: "weighted_voting"
+  # 紧急情况下的投票权重
+  emergency_voting_weights:
+    stone: 0.40
+    eye: 0.35
+    mirror: 0.15
+    book: 0.07
+    wind: 0.03
+  # 冲突升级超时 (秒)
+  conflict_timeout_level1: 10
+  conflict_timeout_level2: 30
+  conflict_timeout_level3: 60
+  # 默认保守方案 (超时自动选择)
+  default_conservative_action: "reduce_50pct_block_all"
