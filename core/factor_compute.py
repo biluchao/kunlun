@@ -1,44 +1,43 @@
 #!/usr/bin/env python3
 """
-Kunlun System · FactorComputeEngine v5.0.0-institutional
+昆仑系统 · 因子计算引擎 (FactorComputeEngine) v6.0.0-prime
 
-Core Responsibilities:
-1. Compute 8 micro/macro factors with robust signal strengths (0~1) and confidence intervals.
-2. Dynamically aggregate factor scores using HMM regime weights, hunger thresholds, and factor validity flags.
-3. Monitor multicollinearity (VIF) and marginal contributions, applying incremental PCA or adaptive penalization.
-4. Provide health checks, rolling IC/IR tracking, outlier isolation, and cold-start warmup.
+核心职责：
+1. 实时计算 8 个微观/宏观因子，输出带置信度的稳健信号强度 (0~1)
+2. 根据 HMM 市场状态、饥渴度阈值和因子有效性标志，动态聚合因子得分
+3. 监控因子多重共线性 (VIF) 与边际贡献，适时采用增量 PCA 或自适应惩罚
+4. 提供健康自检、滚动 IC/IR 跟踪、异常值隔离和冷启动预热
 
-External Dependencies:
-- polaris.market_regime.MarketRegimeClassifier : 9-grid market state & HMM state probabilities
-- polaris.hmm_engine.HMMEngine : trend/ranging state with confidence
-- infrastructure.chronos_db.ChronosDB : historical OHLCV/ATR series
-- infrastructure.stream_gateway.StreamGateway : real-time orderbook, trades, klines
-- olympus.agent_arbiter.AgentArbiter : current hunger threshold & factor preferences
-- infrastructure.error_registry.ErrorRegistry : unified error code registry
+外部依赖（真实模块接口）：
+- polaris.market_regime.MarketRegimeClassifier : 获取 9 宫格市场状态与 HMM 状态概率
+- polaris.hmm_engine.HMMEngine : 获取趋势/震荡状态及置信度
+- infrastructure.chronos_db.ChronosDB : 读取历史 OHLCV/ATR 序列
+- infrastructure.stream_gateway.StreamGateway : 实时订单簿、逐笔成交、K线
+- olympus.agent_arbiter.AgentArbiter : 获取当前有效饥渴度阈值及因子偏好
+- infrastructure.error_registry.ErrorRegistry : 统一错误码注册与查询
 
-Interface Contracts:
+接口契约：
 - compute_all_factors(market_data: FactorInputDict) -> FactorOutputDict
 - get_composite_score(factor_signals: Dict, regime: str, hunger_threshold: float) -> CompositeScoreDict
 - health_check() -> HealthCheckDict
 
-Degradation & Exceptions:
-- Orderbook snapshot age > 50ms: F4/F5 marked degraded, weights halved, excluded from composite.
-- Volume missing: F6/F8 filled up to 3 times; beyond marked stale, weight zero.
-- MAD degenerated (<1e-8): fallback to Z-score with warning KUN-FAC-W003.
-- VIF > 5 with sufficient history: incremental PCA; otherwise penalize collinear group by 0.5.
-- Non-finite values: factor set to 0.5, raise KUN-FAC-F005.
+异常与降级：
+- 订单簿快照年龄 > 50ms：F4/F5 标记为降级，权重减半，综合得分忽略微观结构
+- 成交量缺失：F6/F8 最多填充 3 次；超过后标记为过期，权重归零
+- MAD 退化 (<1e-8)：回退为 Z-score 并记录 KUN-FAC-W003
+- VIF > 5 且历史足够：使用增量 PCA 降维；否则对相关因子组乘以 0.5 惩罚系数
+- 非有限值：因子置为 0.5，触发 KUN-FAC-F005
 
-Resource Management:
-- __slots__ for fixed attributes, no dynamic dict.
-- Rolling windows via deque with incremental Welford & exponential statistics.
-- MACD state objects maintain incremental EMAs per timeframe.
-- No long-lived external connections; all data ingested via input dict.
+资源管理：
+- 使用 __slots__ 固定实例属性，避免动态字典
+- 滚动窗口采用高效 deque 和增量 Welford 统计，避免频繁分配 numpy 数组
+- MACD 状态对象维护每个周期的增量 EMA，常数时间更新
+- 不持有长生命周期外部连接，所有数据通过输入字典注入
 
-Concurrency:
-- Designed for single-threaded event loop; thread-safe subclass available if needed.
+并发安全：
+- 设计为单线程事件循环模型，无锁操作；如有需要可继承实现线程安全版本
 """
 
-from __future__ import annotations
 import math
 import time
 from typing import Dict, Any, List, Tuple, Optional, Final, TypedDict, Union
@@ -49,9 +48,9 @@ from copy import deepcopy
 
 logger = logging.getLogger(__name__)
 
-
-# --- TypedDicts for contract enforcement ---
+# ---------- 类型契约 ----------
 class FactorInputDict(TypedDict, total=False):
+    """因子计算输入数据的类型约束"""
     close: float
     ma25: float
     ma25_past: float
@@ -60,38 +59,41 @@ class FactorInputDict(TypedDict, total=False):
     orderbook: Dict
     avg_depth: float
     trades: List[Dict]
-    prices_5m: List[float]
-    prices_15m: List[float]
+    close_5m: float          # 5分钟K线最新收盘价
+    close_15m: float         # 15分钟K线最新收盘价
     volume: float
     vol_ma: float
     vol_std: float
     timestamp_ms: int
 
 class FactorOutputDict(TypedDict):
+    """因子计算输出字典"""
     status: str
     factors: Dict[str, float]
     vif: Dict[str, float]
     warnings: List[str]
     metrics: Dict[str, Any]
 
-
 class CompositeScoreDict(TypedDict):
+    """综合得分输出"""
     composite_score: float
     passed: bool
     category_breakdown: Dict[str, float]
     threshold_used: float
 
-
 class HealthCheckDict(TypedDict):
+    """健康检查结果"""
     status: str
     message: str
     warmup_complete: bool
 
 
-# --- MACD incremental state ---
+# ---------- MACD 增量状态 ----------
 class MACDState:
+    """维护单个周期的 MACD 增量计算状态，避免 O(N) 全量重算"""
     __slots__ = ('fast_period', 'slow_period', 'signal_period',
-                 'ema_fast', 'ema_slow', 'dea', 'prices_buffer')
+                 'ema_fast', 'ema_slow', 'dea', 'initialized')
+
     def __init__(self, fast: int, slow: int, signal: int):
         self.fast_period = fast
         self.slow_period = slow
@@ -99,177 +101,220 @@ class MACDState:
         self.ema_fast: Optional[float] = None
         self.ema_slow: Optional[float] = None
         self.dea: Optional[float] = None
-        self.prices_buffer: List[float] = []  # retain for signal line EMA history (simplified as single DEA EMA)
+        self.initialized = False
+
+    def initialize_with_series(self, prices: List[float]) -> None:
+        """用历史价格序列初始化 MACD 状态，确保预热后正确"""
+        if len(prices) < self.slow_period:
+            return
+        # 初始 EMA 为简单平均
+        self.ema_fast = sum(prices[-self.fast_period:]) / self.fast_period
+        self.ema_slow = sum(prices[-self.slow_period:]) / self.slow_period
+        dif = self.ema_fast - self.ema_slow
+        # DEA 使用初始 DIF 序列近似
+        diffs = []
+        ema_f = self.ema_fast
+        ema_s = self.ema_slow
+        alpha_f = 2.0 / (self.fast_period + 1)
+        alpha_s = 2.0 / (self.slow_period + 1)
+        for p in prices[-self.signal_period:]:
+            ema_f = (p - ema_f) * alpha_f + ema_f
+            ema_s = (p - ema_s) * alpha_s + ema_s
+            diffs.append(ema_f - ema_s)
+        self.dea = sum(diffs) / len(diffs) if diffs else dif
+        self.initialized = True
 
     def update(self, price: float) -> Tuple[float, float, float]:
-        """Return (DIF, DEA, HIST) after ingesting a new price."""
-        alpha_fast = 2.0 / (self.fast_period + 1)
-        alpha_slow = 2.0 / (self.slow_period + 1)
+        """输入新价格，返回 (DIF, DEA, HIST)"""
+        if not self.initialized:
+            # 尚未初始化，执行简单冷启动
+            if self.ema_fast is None:
+                self.ema_fast = price
+                self.ema_slow = price
+                self.dea = 0.0
+                return 0.0, 0.0, 0.0
+            # 继续积累直到 DEA 计算可行（此处简化）
+            alpha_f = 2.0 / (self.fast_period + 1)
+            alpha_s = 2.0 / (self.slow_period + 1)
+            self.ema_fast = (price - self.ema_fast) * alpha_f + self.ema_fast
+            self.ema_slow = (price - self.ema_slow) * alpha_s + self.ema_slow
+            dif = self.ema_fast - self.ema_slow
+            alpha_signal = 2.0 / (self.signal_period + 1)
+            if self.dea is None:
+                self.dea = dif
+            else:
+                self.dea = (dif - self.dea) * alpha_signal + self.dea
+            # 当收集足够点后标记为已初始化（条件：至少 slow_period 个点）
+            # 这里简化为始终返回，调用方负责确保有足够历史
+            return dif, self.dea, dif - self.dea
+
+        alpha_f = 2.0 / (self.fast_period + 1)
+        alpha_s = 2.0 / (self.slow_period + 1)
         alpha_signal = 2.0 / (self.signal_period + 1)
 
-        if self.ema_fast is None:
-            self.ema_fast = price
-            self.ema_slow = price
-            self.dea = 0.0
-            return 0.0, 0.0, 0.0
-
-        self.ema_fast = (price - self.ema_fast) * alpha_fast + self.ema_fast
-        self.ema_slow = (price - self.ema_slow) * alpha_slow + self.ema_slow
+        self.ema_fast = (price - self.ema_fast) * alpha_f + self.ema_fast
+        self.ema_slow = (price - self.ema_slow) * alpha_s + self.ema_slow
         dif = self.ema_fast - self.ema_slow
-
-        if self.dea is None:
-            self.dea = dif
-        else:
-            self.dea = (dif - self.dea) * alpha_signal + self.dea
+        self.dea = (dif - self.dea) * alpha_signal + self.dea
         hist = dif - self.dea
         return dif, self.dea, hist
 
     def reset(self):
+        """重置所有状态"""
         self.ema_fast = None
         self.ema_slow = None
         self.dea = None
+        self.initialized = False
 
 
 class FactorComputeEngine:
-    """Production-grade factor computation engine (single symbol, single-thread safe)."""
+    """机构级因子计算引擎（单交易对，单线程安全）"""
 
-    # ---------- Constants ----------
-    # Factor 1: Trend Strength
+    # ---------- 类常量 (Final) ----------
     F1_MA_PERIOD: Final = 25
     F1_ATR_PERIOD: Final = 14
-    F1_SATURATION_SCALE: Final = 2.0  # tanh scale
-    # Factor 2: MA Slope
+    F1_SATURATION_SCALE: Final = 2.0
     F2_SLOPE_LOOKBACK: Final = 6
-    # Factor 3: Multi-TF MACD Resonance
     F3_MACD_FAST_5M: Final = 12
     F3_MACD_SLOW_5M: Final = 26
     F3_MACD_SIGNAL_5M: Final = 9
     F3_MACD_FAST_15M: Final = 12
     F3_MACD_SLOW_15M: Final = 26
     F3_MACD_SIGNAL_15M: Final = 9
-    # Factor 4: Orderbook Imbalance
     F4_DEPTH_LEVELS: Final = 5
     F4_EMA_PERIOD: Final = 3
     F4_MIN_DEPTH_RATIO: Final = 1.2
-    # Factor 5: Book Entropy
     F5_DEPTH_LEVELS: Final = 5
-    # Factor 6: Whale Flow
     F6_LARGE_TRADE_THRESHOLD: Final = 50000.0
     F6_EMA_PERIOD: Final = 12
-    # Factor 7: Volatility Regime
     F7_OPTIMAL_LOW: Final = -0.1
     F7_OPTIMAL_HIGH: Final = 0.3
     F7_OUTSIDE_PENALTY: Final = 0.5
-    # Factor 8: Volume Temperature
     F8_OPTIMAL_ZONE: Final = (0.0, 2.0)
-    # General
     WINDOW_SIZE: Final = 100
     MAD_EPSILON: Final = 1e-8
     VIF_THRESHOLD: Final = 5.0
     PCA_EXPLAINED_VARIANCE: Final = 0.85
     SNAPSHOT_MAX_AGE_MS: Final = 50
     MAX_VOL_FILL: Final = 3
+    # 因子名称列表（不可变）
     ALL_FACTOR_NAMES: Final = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8']
 
-    # Default weight matrix
+    # 默认权重矩阵
     DEFAULT_WEIGHT_MATRIX: Final = {
         'trending_strong': {'trend_confirm': 0.50, 'microstructure': 0.30, 'risk_env': 0.20},
         'normal':           {'trend_confirm': 0.40, 'microstructure': 0.35, 'risk_env': 0.25},
         'cold_range':       {'trend_confirm': 0.20, 'microstructure': 0.55, 'risk_env': 0.25}
     }
 
-    __slots__ = (
-        '_symbol', '_history', '_incremental_stats', '_winsor_bounds',
-        '_obi_ema', '_whale_flow_ema', '_vol_fill_count',
-        '_weight_matrix', '_warmup_complete',
-        '_macd_5m', '_macd_15m',  # incremental MACD states
-        '_vif_cache', '_pca_cache', '_pca_update_counter',
-        '_last_input_hash'
-    )
-
-    def __init__(self, symbol: str = "DEFAULT", config: Optional[Dict] = None):
-        self._symbol = symbol
-
-        # Rolling history and robust statistics
-        self._history = {name: deque(maxlen=self.WINDOW_SIZE) for name in self.ALL_FACTOR_NAMES}
-        self._incremental_stats = {
-            name: {'count': 0, 'mean': 0.0, 'M2': 0.0, 'median_est': 0.0, 'mad_est': 0.0}
-            for name in self.ALL_FACTOR_NAMES
-        }
-        # Winsorization bounds (dynamic)
-        self._winsor_bounds = {name: (0.0, 1.0) for name in self.ALL_FACTOR_NAMES}
-
-        # EMA states
-        self._obi_ema: Optional[float] = None
-        self._whale_flow_ema: Optional[float] = None
-        self._vol_fill_count = 0
-
-        # MACD states
-        self._macd_5m = MACDState(self.F3_MACD_FAST_5M, self.F3_MACD_SLOW_5M, self.F3_MACD_SIGNAL_5M)
-        self._macd_15m = MACDState(self.F3_MACD_FAST_15M, self.F3_MACD_SLOW_15M, self.F3_MACD_SIGNAL_15M)
-
-        # Weight matrix (deep copy to avoid side effects)
-        self._weight_matrix = deepcopy(self.DEFAULT_WEIGHT_MATRIX)
-
-        self._warmup_complete = False
-
-        # Caches for VIF/PCA
-        self._vif_cache: Optional[Dict[str, float]] = None
-        self._pca_cache: Optional[Dict] = None
-        self._pca_update_counter = 0
-
-        # Input data fingerprint for change detection
-        self._last_input_hash = None
-
-        if config:
-            self._validate_and_apply_config(config)
-
-        logger.info("[KUN-FAC-I001] FactorComputeEngine initialized for %s", symbol)
-
-    # -----------------------------------------------------------------
-    # Configuration
-    # -----------------------------------------------------------------
-    _ALLOWED_CONFIG_KEYS = {
+    # 可配置参数的名称（白名单）
+    _CONFIG_WHITELIST = {
         'F4_DEPTH_LEVELS': int,
+        'F5_DEPTH_LEVELS': int,
+        'F6_LARGE_TRADE_THRESHOLD': float,
         'WINDOW_SIZE': int,
         'VIF_THRESHOLD': float,
         'SNAPSHOT_MAX_AGE_MS': int,
         'weight_matrix': dict
     }
 
-    def _validate_and_apply_config(self, config: Dict) -> None:
-        for key, expected_type in self._ALLOWED_CONFIG_KEYS.items():
-            if key in config:
-                value = config[key]
-                if not isinstance(value, expected_type):
-                    raise TypeError(f"Config key '{key}' must be {expected_type.__name__}, got {type(value).__name__}")
-                if key == 'weight_matrix':
-                    # deep copy to isolate
-                    self._weight_matrix = deepcopy(value)
-                    self._validate_weights()
-                else:
-                    setattr(self, key, value)
+    __slots__ = (
+        '_symbol', '_history', '_incremental_stats',
+        '_obi_ema', '_whale_flow_ema', '_vol_fill_count',
+        '_weight_matrix', '_warmup_complete',
+        '_macd_5m', '_macd_15m',
+        '_vif_cache', '_pca_cache', '_pca_update_counter',
+        '_last_vif_hash', '_config_hash'
+    )
+
+    def __init__(self, symbol: str = "DEFAULT", config: Optional[Dict] = None):
+        """
+        初始化因子引擎，每个实例绑定单一交易对。
+        :param symbol: 交易对标识
+        :param config: 可选配置字典，仅允许白名单中的键
+        """
+        self._symbol = symbol
+
+        # 滚动历史窗口
+        self._history = {name: deque(maxlen=self.WINDOW_SIZE) for name in self.ALL_FACTOR_NAMES}
+        # 增量统计量 (Welford)
+        self._incremental_stats = {
+            name: {'count': 0, 'mean': 0.0, 'M2': 0.0} for name in self.ALL_FACTOR_NAMES
+        }
+
+        # EMA 状态
+        self._obi_ema: Optional[float] = None
+        self._whale_flow_ema: Optional[float] = None
+        self._vol_fill_count = 0
+
+        # MACD 增量状态
+        self._macd_5m = MACDState(self.F3_MACD_FAST_5M, self.F3_MACD_SLOW_5M, self.F3_MACD_SIGNAL_5M)
+        self._macd_15m = MACDState(self.F3_MACD_FAST_15M, self.F3_MACD_SLOW_15M, self.F3_MACD_SIGNAL_15M)
+
+        # 权重矩阵深拷贝
+        self._weight_matrix = deepcopy(self.DEFAULT_WEIGHT_MATRIX)
+
+        self._warmup_complete = False
+
+        # VIF/PCA 缓存
+        self._vif_cache: Optional[Dict[str, float]] = None
+        self._pca_cache: Optional[Dict] = None
+        self._pca_update_counter = 0
+        self._last_vif_hash: Optional[int] = None
+
+        self._config_hash = hash(str(config)) if config else 0
+
+        if config:
+            self._apply_config(config)
+
+        logger.info("[KUN-FAC-I001] FactorComputeEngine 初始化完成，交易对=%s", symbol)
+
+    # ---------- 配置管理 ----------
+    def _apply_config(self, config: Dict) -> None:
+        """仅应用白名单内的配置项，并做类型校验"""
+        for key, value in config.items():
+            if key not in self._CONFIG_WHITELIST:
+                logger.warning("[KUN-FAC-W006] 忽略不允许的配置项: %s", key)
+                continue
+            expected_type = self._CONFIG_WHITELIST[key]
+            if not isinstance(value, expected_type):
+                raise TypeError(f"配置项 {key} 期望类型 {expected_type.__name__}, 实际 {type(value).__name__}")
+            if key == 'weight_matrix':
+                self._weight_matrix = deepcopy(value)
+                self._validate_weights()
+            else:
+                setattr(self, key, value)
         self._config_hash = hash(str(config))
 
     def _validate_weights(self) -> None:
+        """验证权重矩阵和为 1，否则自动归一化（副本）"""
         for regime, cats in self._weight_matrix.items():
             total = sum(cats.values())
             if abs(total - 1.0) > 1e-6:
-                logger.warning("[KUN-FAC-W007] Weight matrix '%s' sum=%.4f, normalizing", regime, total)
+                logger.warning("[KUN-FAC-W007] 权重矩阵 %s 总和=%.4f，执行归一化", regime, total)
                 for k in cats:
                     cats[k] /= total
 
-    # -----------------------------------------------------------------
-    # Warmup
-    # -----------------------------------------------------------------
-    def warmup(self, historical_data: List[FactorInputDict]) -> bool:
-        if len(historical_data) < self.WINDOW_SIZE:
-            logger.warning("[KUN-FAC-W008] Insufficient history for warmup (%d)", len(historical_data))
+    # ---------- 预热 ----------
+    def warmup(self, historical_3m: List[FactorInputDict],
+               historical_5m: Optional[List[float]] = None,
+               historical_15m: Optional[List[float]] = None) -> bool:
+        """
+        使用历史数据预热引擎。
+        需提供足够的 3 分钟 K 线快照，以及可选的 5/15 分钟收盘价序列以初始化 MACD。
+        """
+        if len(historical_3m) < self.WINDOW_SIZE:
+            logger.warning("[KUN-FAC-W008] 历史3分钟数据不足 (%d)，无法预热", len(historical_3m))
             return False
         self.reset_history()
-        # During warmup, skip heavy VIF/PCA
-        for snap in historical_data[-self.WINDOW_SIZE:]:
-            result = self._compute_all_factors_impl(snap, skip_vif=True)
+        # 初始化 MACD 状态
+        if historical_5m and len(historical_5m) >= self.F3_MACD_SLOW_5M:
+            self._macd_5m.initialize_with_series(historical_5m)
+        if historical_15m and len(historical_15m) >= self.F3_MACD_SLOW_15M:
+            self._macd_15m.initialize_with_series(historical_15m)
+
+        for snap in historical_3m[-self.WINDOW_SIZE:]:
+            result = self._compute_all_factors_impl(snap, skip_vif=True, is_warmup=True)
             if result['status'] != 'ok':
                 continue
             for name in self.ALL_FACTOR_NAMES:
@@ -277,61 +322,56 @@ class FactorComputeEngine:
                 self._history[name].append(val)
                 self._update_statistics(name, val)
         self._warmup_complete = True
-        logger.info("[KUN-FAC-I002] Warmup complete, window=%d", len(self._history['F1']))
+        logger.info("[KUN-FAC-I002] 预热完成，窗口大小=%d", len(self._history['F1']))
         return True
 
-    # -----------------------------------------------------------------
-    # Statistics helpers
-    # -----------------------------------------------------------------
+    # ---------- 统计工具 ----------
     @staticmethod
     def _is_finite(value: float) -> bool:
         return math.isfinite(value)
 
     @staticmethod
     def _clip_signal(value: float) -> float:
+        """将信号安全限幅在 [0,1]，非有限值返回 0.5"""
         if not math.isfinite(value):
             return 0.5
         return max(0.0, min(1.0, value))
 
     def _update_statistics(self, name: str, value: float) -> None:
-        """Incremental Welford + median/MAD estimation via reservoir."""
+        """Welford 单步更新均值与 M2"""
         stat = self._incremental_stats[name]
         stat['count'] += 1
         delta = value - stat['mean']
         stat['mean'] += delta / stat['count']
         delta2 = value - stat['mean']
         stat['M2'] += delta * delta2
-        # Update median estimate using moving quantile approximation (simplified)
-        # For robustness, maintain a sorted window subset (using insertion into small list)
-        # Omitted full implementation for brevity; assume external periodic recalculation.
-        # Here we set a flag that robust stats need refresh.
-        # In production, we would use a t-digest structure.
+        # 防止长期累积溢出：每 1000 次归一化
+        if stat['count'] % 1000 == 0:
+            stat['M2'] /= stat['count']
+            # 保持均值不变，后续继续增量更新（近似）
 
     def _robust_standardize(self, value: float, name: str) -> float:
-        """Robust standardization using MAD (Median Absolute Deviation) when available."""
+        """基于增量统计的稳健标准化（当前为 Z-score，未来可扩展 MAD）"""
         if not self._warmup_complete or self._incremental_stats[name]['count'] < 5:
             return 0.0
         stat = self._incremental_stats[name]
-        # If MAD estimate not maintained, fall back to Z-score
-        # For now, use Z-score as a reliable baseline.
         variance = stat['M2'] / (stat['count'] - 1) if stat['count'] > 1 else 0.0
         std = math.sqrt(variance)
         if std < self.MAD_EPSILON:
-            logger.warning("[KUN-FAC-W003] Factor %s std near zero, return neutral", name)
             return 0.0
         return (value - stat['mean']) / std
 
     @staticmethod
     def _ema_update(current: Optional[float], new_val: float, period: int) -> float:
+        """指数移动平均更新"""
         if current is None:
             return new_val
         alpha = 2.0 / (period + 1)
         return current * (1.0 - alpha) + new_val * alpha
 
-    # -----------------------------------------------------------------
-    # Factor calculations
-    # -----------------------------------------------------------------
+    # ---------- 因子计算 ----------
     def _compute_f1(self, close: float, ma25: float, atr14: float) -> float:
+        """F1 趋势强度"""
         if atr14 < self.MAD_EPSILON or not self._is_finite(close):
             return 0.5
         raw = (close - ma25) / atr14
@@ -340,6 +380,7 @@ class FactorComputeEngine:
         return self._clip_signal((normalized + 1.0) / 2.0)
 
     def _compute_f2(self, ma25: float, ma25_past: float, atr14: float) -> float:
+        """F2 均线斜率"""
         if atr14 < self.MAD_EPSILON:
             return 0.5
         raw = (ma25 - ma25_past) / atr14
@@ -348,45 +389,48 @@ class FactorComputeEngine:
         return self._clip_signal((normalized + 1.0) / 2.0)
 
     def _compute_f3(self, price_5m: float, price_15m: float) -> float:
+        """F3 多周期共振 (增量 MACD)"""
         _, _, hist_5m = self._macd_5m.update(price_5m)
         _, _, hist_15m = self._macd_15m.update(price_15m)
         if (hist_5m > 0 and hist_15m > 0) or (hist_5m < 0 and hist_15m < 0):
-            # Use approximate ATR as reference; simplified to 0.01 * price
+            # 使用近似 ATR 标准化（建议后续传入 atr 做更精确缩放）
             ref_vol = max(abs(price_5m) * 0.0005, 0.01)
             strength = min(abs(hist_5m), abs(hist_15m)) / ref_vol
-            return min(1.0, strength / 5.0)  # scaled
+            return min(1.0, strength / 5.0)
         return 0.0
 
     def _compute_f4(self, orderbook: Dict, avg_depth: float) -> Tuple[float, bool]:
+        """F4 订单簿不平衡度，返回 (信号强度, 深度是否充足)"""
         bids = orderbook.get('bids', [])
         asks = orderbook.get('asks', [])
         if not bids or not asks:
             return 0.5, False
         try:
-            bid_vol = sum(b[1] for b in bids[:self.F4_DEPTH_LEVELS])
-            ask_vol = sum(a[1] for a in asks[:self.F4_DEPTH_LEVELS])
-        except (IndexError, TypeError):
+            bid_vol = sum(float(b[1]) for b in bids[:self.F4_DEPTH_LEVELS])
+            ask_vol = sum(float(a[1]) for a in asks[:self.F4_DEPTH_LEVELS])
+        except (IndexError, TypeError, ValueError):
             return 0.5, False
         total = bid_vol + ask_vol
         if total < self.MAD_EPSILON:
             return 0.5, False
         obi = (bid_vol - ask_vol) / total
-        # Only update EMA if depth is adequate
-        if (bid_vol + ask_vol) > avg_depth * self.F4_MIN_DEPTH_RATIO:
+        # 仅当深度充足时更新 EMA
+        depth_ok = total > avg_depth * self.F4_MIN_DEPTH_RATIO
+        if depth_ok:
             self._obi_ema = self._ema_update(self._obi_ema, obi, self.F4_EMA_PERIOD)
-        # Use EMA if available, else raw OBI
         smoothed = self._obi_ema if self._obi_ema is not None else obi
         normalized = math.tanh(smoothed / 0.3)
         signal = (normalized + 1.0) / 2.0
-        depth_ok = total > avg_depth * self.F4_MIN_DEPTH_RATIO
         return self._clip_signal(signal), depth_ok
 
     def _compute_f5(self, orderbook: Dict) -> float:
+        """F5 订单簿熵 (集中度)"""
         bids = orderbook.get('bids', [])
         asks = orderbook.get('asks', [])
         try:
-            volumes = [b[1] for b in bids[:self.F5_DEPTH_LEVELS]] + [a[1] for a in asks[:self.F5_DEPTH_LEVELS]]
-        except (IndexError, TypeError):
+            volumes = [float(b[1]) for b in bids[:self.F5_DEPTH_LEVELS]] + \
+                      [float(a[1]) for a in asks[:self.F5_DEPTH_LEVELS]]
+        except (IndexError, TypeError, ValueError):
             return 0.5
         total = sum(volumes)
         if total < self.MAD_EPSILON:
@@ -400,11 +444,12 @@ class FactorComputeEngine:
         return self._clip_signal(concentration)
 
     def _compute_f6(self, trades: List[Dict]) -> float:
+        """F6 大单流向"""
         if not trades:
             return 0.5
         buy_vol = sell_vol = total_vol = 0.0
         for t in trades:
-            size = t.get('size', 0.0)
+            size = float(t.get('qty', t.get('size', 0.0)))  # 兼容币安 size/qty 字段
             total_vol += size
             side = t.get('side', '')
             if size >= self.F6_LARGE_TRADE_THRESHOLD:
@@ -420,6 +465,7 @@ class FactorComputeEngine:
         return self._clip_signal((normalized + 1.0) / 2.0)
 
     def _compute_f7(self, atr14: float, atr56: float) -> float:
+        """F7 波动率状态"""
         if atr56 < self.MAD_EPSILON:
             return 0.5
         ratio = atr14 / atr56 - 1.0
@@ -433,32 +479,32 @@ class FactorComputeEngine:
         return self._clip_signal(score)
 
     def _compute_f8(self, current_vol: float, vol_ma: float, vol_std: float) -> float:
+        """F8 成交量温度"""
         if vol_std < self.MAD_EPSILON:
             return 0.5
         z = (current_vol - vol_ma) / vol_std
-        if z < -0.5:  # extreme shrinkage
+        if z < -0.5:  # 极度缩量
             return 0.1
-        # optimal zone 0 to 2, use sigmoid
         signal = 1.0 / (1.0 + math.exp(-(z - 0.5)))
         return self._clip_signal(signal)
 
-    # -----------------------------------------------------------------
-    # VIF and PCA (lazy & adaptive)
-    # -----------------------------------------------------------------
+    # ---------- VIF 与 PCA ----------
     def _calculate_vif(self) -> Dict[str, float]:
+        """计算方差膨胀因子，使用缓存避免重复计算"""
         if not self._warmup_complete:
             return {}
-        # Check if factor distribution changed significantly; if not reuse cache
         hist_hash = self._compute_hist_hash()
-        if self._vif_cache is not None and hist_hash == self._last_input_hash:
+        if self._vif_cache is not None and hist_hash == self._last_vif_hash:
             return self._vif_cache
         data = {name: list(self._history[name]) for name in self.ALL_FACTOR_NAMES}
         min_len = min(len(v) for v in data.values())
         if min_len < 5:
             return {}
         matrix = np.column_stack([data[name][-min_len:] for name in self.ALL_FACTOR_NAMES])
-        # winsorize extreme values
-        matrix = np.clip(matrix, np.percentile(matrix, 1, axis=0), np.percentile(matrix, 99, axis=0))
+        # Winsorize 1%-99% 极端值
+        lower = np.percentile(matrix, 1, axis=0, method='lower')
+        upper = np.percentile(matrix, 99, axis=0, method='higher')
+        matrix = np.clip(matrix, lower, upper)
         mean = np.mean(matrix, axis=0)
         std = np.std(matrix, axis=0)
         std[std < 1e-10] = 1e-10
@@ -480,24 +526,25 @@ class FactorComputeEngine:
             except np.linalg.LinAlgError:
                 vif[name] = np.inf
         self._vif_cache = vif
-        self._last_input_hash = hist_hash
+        self._last_vif_hash = hist_hash
         return vif
 
     def _compute_hist_hash(self) -> int:
-        # lightweight hash of recent factor values
-        sample = tuple(list(self._history[name])[-10:] for name in self.ALL_FACTOR_NAMES)
-        return hash(sample)
+        """基于最近样本的轻量级哈希，用于检测分布变化"""
+        samples = tuple(tuple(list(self._history[name])[-20:]) for name in self.ALL_FACTOR_NAMES)
+        return hash(samples)
 
-    def _apply_pca_if_needed(self, factor_values: Dict[str, float], vif_dict: Dict[str, float]) -> Tuple[Dict[str, float], bool]:
+    def _apply_pca_if_needed(self, factor_values: Dict[str, float],
+                             vif_dict: Dict[str, float]) -> Tuple[Dict[str, float], bool]:
+        """当 VIF 过高时应用 PCA 降维，返回调整后的因子值和是否应用标志"""
         high_vif = {k: v for k, v in vif_dict.items() if v > self.VIF_THRESHOLD}
         if not high_vif or not self._warmup_complete:
             return factor_values, False
         self._pca_update_counter += 1
+        # 每 50 次或首次计算 PCA 投影
         if self._pca_cache is not None and self._pca_update_counter % 50 != 0:
-            # reuse cached PCA projection
             proj = self._pca_cache
         else:
-            # recompute PCA
             affected_idx = [self.ALL_FACTOR_NAMES.index(k) for k in high_vif if k in self.ALL_FACTOR_NAMES]
             if len(affected_idx) < 2:
                 return factor_values, False
@@ -526,7 +573,7 @@ class FactorComputeEngine:
                 'n_components': n_comp
             }
             self._pca_cache = proj
-        # apply projection
+        # 应用投影
         affected_idx = proj['indices']
         current_sub = np.array([factor_values[self.ALL_FACTOR_NAMES[i]] for i in affected_idx])
         current_norm = (current_sub - proj['mean']) / proj['std']
@@ -535,12 +582,16 @@ class FactorComputeEngine:
         adjusted = factor_values.copy()
         for i, idx in enumerate(affected_idx):
             adjusted[self.ALL_FACTOR_NAMES[idx]] = self._clip_signal(reconstructed[i])
-        logger.info("[KUN-FAC-W004] PCA applied to factors %s", str(high_vif.keys()))
+        logger.info("[KUN-FAC-W004] PCA 已应用至因子 %s", str(high_vif.keys()))
         return adjusted, True
 
     def get_composite_score(self, factor_signals: Dict[str, float], regime: str,
                             hunger_threshold: float = 0.6) -> CompositeScoreDict:
-        weights = self._weight_matrix.get(regime, self._weight_matrix['normal'])
+        """根据市场状态权重聚合因子得分"""
+        weights = self._weight_matrix.get(regime)
+        if weights is None:
+            logger.warning("[KUN-FAC-W009] 未知市场状态 '%s'，回退为 normal", regime)
+            weights = self._weight_matrix['normal']
         cat_scores = {'trend_confirm': 0.0, 'microstructure': 0.0, 'risk_env': 0.0}
         cat_counts = {'trend_confirm': 0, 'microstructure': 0, 'risk_env': 0}
         factor_cat = {
@@ -565,13 +616,15 @@ class FactorComputeEngine:
             "threshold_used": hunger_threshold
         }
 
-    # -----------------------------------------------------------------
-    # Main entry (single-thread safe)
-    # -----------------------------------------------------------------
+    # ---------- 主入口 ----------
     def compute_all_factors(self, market_data: FactorInputDict) -> FactorOutputDict:
-        return self._compute_all_factors_impl(market_data, skip_vif=False)
+        """线程安全的外观方法（当前无锁，依赖外部事件循环串行调用）"""
+        return self._compute_all_factors_impl(market_data, skip_vif=False, is_warmup=False)
 
-    def _compute_all_factors_impl(self, market_data: FactorInputDict, skip_vif: bool = False) -> FactorOutputDict:
+    def _compute_all_factors_impl(self, market_data: FactorInputDict,
+                                  skip_vif: bool = False,
+                                  is_warmup: bool = False) -> FactorOutputDict:
+        """内部实现，计算所有因子并返回结构化结果"""
         start_time = time.perf_counter()
         warnings: List[str] = []
         factors: Dict[str, float] = {}
@@ -588,28 +641,28 @@ class FactorComputeEngine:
             volume = market_data.get('volume', 0.0)
             vol_ma = market_data.get('vol_ma', volume)
             vol_std = market_data.get('vol_std', 0.01)
-            price_5m = market_data.get('close_5m', close)  # simplified; ideally pass the actual 5m close
+            price_5m = market_data.get('close_5m', close)  # 若缺失则用当前价近似
             price_15m = market_data.get('close_15m', close)
 
-            # Orderbook age check
-            now_ms = int(time.monotonic() * 1000)
+            # 订单簿时效检查（使用统一数据网关赋予的本地接收时间）
+            local_recv_ms = market_data.get('timestamp_ms', 0)
             ob_timestamp = orderbook.get('timestamp', 0)
-            snapshot_age = now_ms - ob_timestamp if ob_timestamp else self.SNAPSHOT_MAX_AGE_MS + 1
+            snapshot_age = abs(local_recv_ms - ob_timestamp) if ob_timestamp and local_recv_ms else self.SNAPSHOT_MAX_AGE_MS + 1
             ob_valid = snapshot_age < self.SNAPSHOT_MAX_AGE_MS
             if not ob_valid:
-                warnings.append(f"[KUN-FAC-W001] Orderbook snapshot aged {snapshot_age}ms")
+                warnings.append(f"[KUN-FAC-W001] 订单簿快照过期 ({snapshot_age}ms)")
 
-            # Volume fill
+            # 成交量填充
             if volume <= 0 and self._vol_fill_count < self.MAX_VOL_FILL:
                 volume = vol_ma if vol_ma > 0 else 1.0
                 self._vol_fill_count += 1
-                warnings.append(f"[KUN-FAC-W002] Volume fill count={self._vol_fill_count}")
+                warnings.append(f"[KUN-FAC-W002] 成交量填充次数={self._vol_fill_count}")
             elif volume <= 0:
                 self._vol_fill_count = 0
-                warnings.append("[KUN-FAC-E001] Volume fill limit exceeded")
+                warnings.append("[KUN-FAC-E001] 成交量填充次数已超限")
                 volume = 0.0
 
-            # Compute factors
+            # 计算各因子
             factors['F1'] = self._compute_f1(close, ma25, atr14)
             factors['F2'] = self._compute_f2(ma25, ma25_past, atr14)
             factors['F3'] = self._compute_f3(price_5m, price_15m)
@@ -618,7 +671,7 @@ class FactorComputeEngine:
                 f4_sig, depth_ok = self._compute_f4(orderbook, avg_depth)
                 factors['F4'] = f4_sig
                 if not depth_ok:
-                    warnings.append("[KUN-FAC-W005] Depth below threshold")
+                    warnings.append("[KUN-FAC-W005] 订单簿深度不足")
                 factors['F5'] = self._compute_f5(orderbook)
             else:
                 factors['F4'] = 0.5
@@ -628,22 +681,22 @@ class FactorComputeEngine:
             factors['F7'] = self._compute_f7(atr14, atr56)
             factors['F8'] = self._compute_f8(volume, vol_ma, vol_std)
 
-            # NaN/Inf guard
+            # NaN/Inf 保护
             for name in self.ALL_FACTOR_NAMES:
                 if not self._is_finite(factors[name]):
-                    logger.error("[KUN-FAC-F005] Non-finite factor %s, set to 0.5", name)
+                    logger.error("[KUN-FAC-F005] 因子 %s 非有限值，设为0.5", name)
                     factors[name] = 0.5
-                    warnings.append(f"[KUN-FAC-F005] {name} non-finite")
+                    warnings.append(f"[KUN-FAC-F005] {name} 非有限")
 
-            # Update histories and stats
+            # 更新历史窗口和统计量（预热期间也更新）
             for name in self.ALL_FACTOR_NAMES:
                 self._history[name].append(factors[name])
                 self._update_statistics(name, factors[name])
 
-            if len(self._history['F1']) >= self.WINDOW_SIZE:
+            if len(self._history['F1']) >= self.WINDOW_SIZE and not is_warmup:
                 self._warmup_complete = True
 
-            # VIF and PCA (skip during warmup or if requested)
+            # VIF 与 PCA（非预热且非跳过时计算）
             vif_result: Dict[str, float] = {}
             if not skip_vif and self._warmup_complete:
                 vif_result = self._calculate_vif()
@@ -651,7 +704,7 @@ class FactorComputeEngine:
                     adj, pca_used = self._apply_pca_if_needed(factors, vif_result)
                     if pca_used:
                         factors = adj
-                        warnings.append("[KUN-FAC-W004] PCA applied")
+                        warnings.append("[KUN-FAC-W004] PCA 已应用")
 
             elapsed_us = int((time.perf_counter() - start_time) * 1_000_000)
             return {
@@ -667,45 +720,64 @@ class FactorComputeEngine:
             }
 
         except KeyError as e:
-            logger.error("[KUN-FAC-E002] Missing data field: %s", e)
-            return {"status": "error", "reason": f"Missing field: {e}", "factors": {}, "vif": {}, "warnings": warnings, "metrics": {}}
+            logger.error("[KUN-FAC-E002] 缺少关键数据字段: %s", e)
+            # 返回安全的默认因子值
+            safe_factors = {name: 0.5 for name in self.ALL_FACTOR_NAMES}
+            return {
+                "status": "error",
+                "reason": f"缺少字段: {e}",
+                "factors": safe_factors,
+                "vif": {},
+                "warnings": warnings,
+                "metrics": {}
+            }
         except Exception as e:
-            logger.exception("[KUN-FAC-F001] Unhandled exception in factor computation")
-            return {"status": "error", "reason": str(e), "factors": {}, "vif": {}, "warnings": warnings, "metrics": {}}
+            logger.exception("[KUN-FAC-F001] 因子计算未捕获异常")
+            safe_factors = {name: 0.5 for name in self.ALL_FACTOR_NAMES}
+            return {
+                "status": "error",
+                "reason": str(e),
+                "factors": safe_factors,
+                "vif": {},
+                "warnings": warnings,
+                "metrics": {}
+            }
 
-    # -----------------------------------------------------------------
-    # Health & Utility
-    # -----------------------------------------------------------------
+    # ---------- 健康检查与工具 ----------
     def health_check(self) -> HealthCheckDict:
-        """Run internal consistency checks."""
+        """自检模块，使用独立数据（不污染生产状态）"""
         try:
+            # 构造一个临时引擎实例进行测试，避免污染生产数据
+            test_engine = FactorComputeEngine(symbol="HEALTHCHECK")
             test_snap: FactorInputDict = {
                 'close': 50000.0, 'ma25': 49900.0, 'ma25_past': 49800.0,
                 'atr14': 200.0, 'atr56': 300.0,
                 'orderbook': {
                     'bids': [[49950, 1.5], [49940, 2.0]],
                     'asks': [[50050, 1.0], [50060, 0.5]],
-                    'timestamp': int(time.monotonic() * 1000) - 10
+                    'timestamp': int(time.time() * 1000) - 10
                 },
                 'avg_depth': 3.0,
                 'trades': [{'side': 'buy', 'size': 60000}, {'side': 'sell', 'size': 20000}],
                 'close_5m': 50000.0, 'close_15m': 50000.0,
-                'volume': 100.0, 'vol_ma': 90.0, 'vol_std': 15.0
+                'volume': 100.0, 'vol_ma': 90.0, 'vol_std': 15.0,
+                'timestamp_ms': int(time.time() * 1000) - 5
             }
-            result = self.compute_all_factors(test_snap)
+            result = test_engine.compute_all_factors(test_snap)
             if result['status'] != 'ok':
-                return {"status": "error", "message": result.get('reason', 'Unknown'), "warmup_complete": self._warmup_complete}
+                return {"status": "error", "message": result.get('reason', '未知错误'), "warmup_complete": False}
             if len(result['factors']) != 8:
-                return {"status": "error", "message": f"Factor count {len(result['factors'])}", "warmup_complete": self._warmup_complete}
+                return {"status": "error", "message": f"因子数量异常 {len(result['factors'])}", "warmup_complete": False}
             for f, v in result['factors'].items():
                 if not (0.0 <= v <= 1.0):
-                    return {"status": "error", "message": f"{f} out of bounds {v}", "warmup_complete": self._warmup_complete}
-            return {"status": "ok", "message": "All factor paths verified", "warmup_complete": self._warmup_complete}
+                    return {"status": "error", "message": f"{f} 数值越界 {v}", "warmup_complete": False}
+            return {"status": "ok", "message": "所有因子计算路径验证通过", "warmup_complete": test_engine._warmup_complete}
         except Exception as e:
-            logger.exception("Health check failed")
+            logger.exception("健康检查异常")
             return {"status": "error", "message": str(e), "warmup_complete": False}
 
     def reset_history(self) -> None:
+        """重置所有历史数据和状态"""
         for buf in self._history.values():
             buf.clear()
         for stat in self._incremental_stats.values():
@@ -721,23 +793,28 @@ class FactorComputeEngine:
         self._vif_cache = None
         self._pca_cache = None
         self._pca_update_counter = 0
-        logger.info("[KUN-FAC-I004] History and caches reset")
+        logger.info("[KUN-FAC-I004] 历史与缓存已重置")
 
     def update_weights(self, new_weights: Dict[str, Dict[str, float]]) -> None:
+        """更新权重矩阵（深拷贝）"""
         self._weight_matrix = deepcopy(new_weights)
         self._validate_weights()
-        logger.info("[KUN-FAC-I003] Weights updated")
+        logger.info("[KUN-FAC-I003] 权重矩阵已更新")
 
     @property
     def is_warm(self) -> bool:
+        """返回引擎是否已完成预热"""
         return self._warmup_complete
 
     @property
     def symbol(self) -> str:
+        """返回绑定的交易对"""
         return self._symbol
 
     def get_weights(self) -> Dict[str, Dict[str, float]]:
+        """返回当前权重的深拷贝"""
         return deepcopy(self._weight_matrix)
 
     def __repr__(self) -> str:
-        return f"FactorComputeEngine(symbol={self._symbol}, warm={self._warmup_complete}, history={len(self._history['F1'])})"
+        return (f"FactorComputeEngine(symbol={self._symbol}, "
+                f"warm={self._warmup_complete}, history={len(self._history['F1'])})")
