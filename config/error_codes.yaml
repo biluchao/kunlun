@@ -1,0 +1,337 @@
+# =============================================================================
+# 昆仑系统 (Kunlun) · 统一错误码注册表
+# 版本: v3.0
+# 文件: config/error_codes.yaml
+# 说明: 所有系统错误码按层级与严重性分类，每个错误码附带中文描述与推荐动作
+# =============================================================================
+
+# 错误码命名规范: KUN-{层级}-{严重性}{序号}
+#   层级: DAT (数据), FAC (因子), EXE (执行), RIS (风控),
+#         AGT (智能体), AI (人工智能), SEC (安全), SYS (系统)
+#   严重性: F (致命), E (错误), W (警告), I (信息)
+
+error_codes:
+
+  # ================================================================
+  # 数据层 (DAT) — 行情接收、存储、对账
+  # ================================================================
+  KUN-DAT-F001:
+    description: "所有WebSocket连接断开超过5秒，系统进入安静模式"
+    action: "立即撤销所有挂单，启动重连，切换备用端点"
+    severity: FATAL
+
+  KUN-DAT-F002:
+    description: "行情数据连续10秒无任何成交更新，疑似交易对冻结"
+    action: "标记该交易对为冻结，暂停所有信号与订单"
+    severity: FATAL
+
+  KUN-DAT-E001:
+    description: "WebSocket消息序列号缺失，无法通过u字段验证连续性"
+    action: "已自动触发REST API补全，若持续出现则检查网络质量"
+    severity: ERROR
+
+  KUN-DAT-E002:
+    description: "REST API补全请求失败或超时，本地订单簿可能不准确"
+    action: "标记本地订单簿为待重建，暂停依赖该对深度因子的开仓"
+    severity: ERROR
+
+  KUN-DAT-W001:
+    description: "行情快照对账偏差超过0.01%，本地订单簿与交易所不一致"
+    action: "自动触发全量快照重建，记录偏差值用于审计"
+    severity: WARNING
+
+  KUN-DAT-W002:
+    description: "数据归档至OSS失败，本地tick数据累积接近磁盘阈值"
+    action: "重试归档(最多3次)，若失败则压缩本地数据并告警"
+    severity: WARNING
+
+  KUN-DAT-I001:
+    description: "数据完整性校验通过，序列号连续无缺失"
+    action: "无"
+    severity: INFO
+
+  KUN-DAT-I002:
+    description: "tick数据成功归档至OSS，本地已清理过期文件"
+    action: "无"
+    severity: INFO
+
+  # ================================================================
+  # 因子层 (FAC) — 因子计算、信号生成
+  # ================================================================
+  KUN-FAC-F001:
+    description: "订单簿快照超过50ms未更新，因子计算暂停"
+    action: "丢弃当前周期因子值，使用上一周期缓存，直至数据恢复"
+    severity: FATAL
+
+  KUN-FAC-F002:
+    description: "8个核心因子中超过半数因数据缺失不可用"
+    action: "停止信号生成，转为持仓监控模式"
+    severity: FATAL
+
+  KUN-FAC-E001:
+    description: "因子IC计算样本不足(<20笔)，跳过本次评估"
+    action: "本次不调整因子权重，保持上一次权重"
+    severity: ERROR
+
+  KUN-FAC-E002:
+    description: "MAD(中位数绝对偏差)退化至零，因子标准化回退至标准差"
+    action: "已自动切换到标准分(Z-score)，监控后续波动"
+    severity: ERROR
+
+  KUN-FAC-W001:
+    description: "因子间VIF(方差膨胀因子)超过5，共线性风险增加"
+    action: "对高相关因子组启动PCA降维，权重暂时缩减"
+    severity: WARNING
+
+  KUN-FAC-W002:
+    description: "单一因子IC连续5日低于0.02，有效性下降"
+    action: "该因子权重降至原30%，若再持续5日则移出因子池"
+    severity: WARNING
+
+  KUN-FAC-I001:
+    description: "因子权重矩阵在状态切换后平滑过渡完成"
+    action: "无"
+    severity: INFO
+
+  KUN-FAC-I002:
+    description: "订单簿快照哈希校验通过，无碰撞"
+    action: "无"
+    severity: INFO
+
+  # ================================================================
+  # 执行层 (EXE) — 订单路由、执行、滑点控制
+  # ================================================================
+  KUN-EXE-F001:
+    description: "紧急平仓触发，市价全平当前仓位"
+    action: "记录触发原因(跨市场/流动性/穿透)，冷却后评估再入场条件"
+    severity: FATAL
+
+  KUN-EXE-F002:
+    description: "止损订单被交易所拒绝，仓位面临无限风险"
+    action: "立即尝试以市价单平仓，同时排查拒单原因"
+    severity: FATAL
+
+  KUN-EXE-E001:
+    description: "API令牌桶耗尽，非关键请求已排队等待"
+    action: "暂停非必要REST查询，优先保证撤单与止损令牌"
+    severity: ERROR
+
+  KUN-EXE-E002:
+    description: "TWAP执行超时，未完成量超过50%，剩余量转为市价"
+    action: "记录滑点偏差，更新该交易对的算法偏好"
+    severity: ERROR
+
+  KUN-EXE-W001:
+    description: "订单成交率连续两次采样低于60%，触发算法切换"
+    action: "已从限价单切换为TWAP(或更激进算法)，监控后续成交"
+    severity: WARNING
+
+  KUN-EXE-W002:
+    description: "实际滑点超过预估滑点1.5倍，但未触及硬限"
+    action: "记录至滑点模型校准队列，本次交易正常完成"
+    severity: WARNING
+
+  KUN-EXE-I001:
+    description: "订单全部成交，成交率100%，滑点在预期内"
+    action: "无"
+    severity: INFO
+
+  KUN-EXE-I002:
+    description: "冰山订单子单拆分完成，隐蔽执行结束"
+    action: "无"
+    severity: INFO
+
+  # ================================================================
+  # 风控层 (RIS) — 熔断、仓位、保证金
+  # ================================================================
+  KUN-RIS-F001:
+    description: "系统级熔断触发：日回撤超过5%或周回撤超过10%"
+    action: "全部策略停止新开仓，只允许平仓与减仓，等待人工介入"
+    severity: FATAL
+
+  KUN-RIS-F002:
+    description: "保证金率低于15%，存在强平风险"
+    action: "强制减仓至保证金率>30%，优先平亏损最大的仓位"
+    severity: FATAL
+
+  KUN-RIS-E001:
+    description: "策略级熔断：连续亏损5笔"
+    action: "暂停该策略6小时，同时通知‘镜’智能体评估策略有效性"
+    severity: ERROR
+
+  KUN-RIS-E002:
+    description: "单一资产仓位超过AUM的15%"
+    action: "禁止继续加仓该资产，并触发逐步减仓至12%以下"
+    severity: ERROR
+
+  KUN-RIS-W001:
+    description: "单日亏损接近3%限制(已达2.5%)，触发预警"
+    action: "新开仓规模自动缩减至正常50%，风控监控频率提升"
+    severity: WARNING
+
+  KUN-RIS-W002:
+    description: "流动性危机指标(Amihud)超过阈值5倍"
+    action: "禁止开仓与加仓，已挂限价单全撤，止损改为市价(限滑点5%)"
+    severity: WARNING
+
+  KUN-RIS-I001:
+    description: "所有风控指标恢复至正常区间"
+    action: "无"
+    severity: INFO
+
+  KUN-RIS-I002:
+    description: "熔断冷却期结束，分阶段恢复交易功能"
+    action: "先恢复平仓权限，观察30分钟后恢复小仓开仓"
+    severity: INFO
+
+  # ================================================================
+  # 智能体层 (AGT) — 智能体决策、冲突、贡献
+  # ================================================================
+  KUN-AGT-F001:
+    description: "冲突升级至三级，在超时后自动执行最保守方案"
+    action: "记录所有智能体投票与最终决策，用于事后分析"
+    severity: FATAL
+
+  KUN-AGT-E001:
+    description: "石智能体否决权触发，强制减仓50%或禁止开仓"
+    action: "记录否决原因(恐惧指数/回撤)，待恐惧下降后自动解除"
+    severity: ERROR
+
+  KUN-AGT-E002:
+    description: "风智能体连续三次探索信号亏损，勇气计数器归零"
+    action: "暂停探索信号至少2小时，等待市场状态改善"
+    severity: ERROR
+
+  KUN-AGT-W001:
+    description: "某智能体贡献值显著下降，滚动窗口评估中效应量不足"
+    action: "该智能体投票权重临时衰减20%，持续监控"
+    severity: WARNING
+
+  KUN-AGT-W002:
+    description: "眼智能体检测到跨市场传染风险，建议强制减仓"
+    action: "若BTC跌幅>2%且相关性>0.7，自动执行减仓50%"
+    severity: WARNING
+
+  KUN-AGT-I001:
+    description: "五大智能体全部健康，正常参与仲裁"
+    action: "无"
+    severity: INFO
+
+  KUN-AGT-I002:
+    description: "书智能体生成每日自省报告并分发至所有智能体"
+    action: "无"
+    severity: INFO
+
+  # ================================================================
+  # AI层 (AI) — DeepSeek推理、沙箱、规则引擎
+  # ================================================================
+  KUN-AI-F001:
+    description: "DeepSeek模型加载失败且规则引擎不可用"
+    action: "所有AI辅助功能暂停，系统使用纯规则模式运行"
+    severity: FATAL
+
+  KUN-AI-E001:
+    description: "OpenClaw沙箱超时(>60秒)或死循环，进程被SIGKILL"
+    action: "记录沙箱执行日志，重启沙箱工作进程"
+    severity: ERROR
+
+  KUN-AI-E002:
+    description: "AI模型响应时间超过30秒，可能模型卡死"
+    action: "终止本次推理，卸载模型，下次请求重新加载"
+    severity: ERROR
+
+  KUN-AI-W001:
+    description: "模型版本切换后质量评分下降>10%，触发自动回滚"
+    action: "恢复旧版本，新版本冻结待人工审核"
+    severity: WARNING
+
+  KUN-AI-W002:
+    description: "AI推理请求时内存不足3.5GB，降级至规则引擎"
+    action: "返回预设规则答案，提示用户稍后重试"
+    severity: WARNING
+
+  KUN-AI-I001:
+    description: "DeepSeek模型成功唤醒，已加载并完成一次推理"
+    action: "无"
+    severity: INFO
+
+  KUN-AI-I002:
+    description: "OpenClaw影子回测完成，策略验证通过"
+    action: "无"
+    severity: INFO
+
+  # ================================================================
+  # 安全层 (SEC) — 认证、权限、密钥
+  # ================================================================
+  KUN-SEC-F001:
+    description: "检测到未授权访问尝试，IP异常或暴力破解"
+    action: "临时锁定账户15分钟，记录来源IP并推送告警"
+    severity: FATAL
+
+  KUN-SEC-E001:
+    description: "双因素认证连续失败3次，账户临时锁定"
+    action: "锁定15分钟，向绑定手机发送告警短信"
+    severity: ERROR
+
+  KUN-SEC-E002:
+    description: "API密钥即将过期(7天内)，未完成自动轮换"
+    action: "立即触发密钥轮换脚本，若失败则通知管理员手动更换"
+    severity: ERROR
+
+  KUN-SEC-W001:
+    description: "操作权限不足，尝试执行需更高级别认证的操作"
+    action: "提示用户补充所需认证因素(如TOTP/SMS)"
+    severity: WARNING
+
+  KUN-SEC-W002:
+    description: "审计日志写入延迟升高，缓冲区接近满"
+    action: "暂停非关键日志，优先保证交易日志写入"
+    severity: WARNING
+
+  KUN-SEC-I001:
+    description: "用户成功完成双因素认证，会话建立"
+    action: "无"
+    severity: INFO
+
+  KUN-SEC-I002:
+    description: "密钥分片完整性校验通过(5/5)"
+    action: "无"
+    severity: INFO
+
+  # ================================================================
+  # 系统层 (SYS) — 资源、降级、热重载
+  # ================================================================
+  KUN-SYS-F001:
+    description: "系统内存使用超过95%，存在OOM风险"
+    action: "立即降级至Lv3：仅平仓，停止所有非关键进程"
+    severity: FATAL
+
+  KUN-SYS-E001:
+    description: "模块热重载失败，验证不通过"
+    action: "自动回滚至上一版本，记录失败原因"
+    severity: ERROR
+
+  KUN-SYS-E002:
+    description: "启动时依赖闭环校验未通过，发现循环依赖或缺失模块"
+    action: "禁止启动，输出依赖关系图，等待修复"
+    severity: ERROR
+
+  KUN-SYS-W001:
+    description: "CPU使用率超过70%，触发Lv1降级"
+    action: "暂停OpenClaw活动，因子更新频率降至200ms"
+    severity: WARNING
+
+  KUN-SYS-W002:
+    description: "月度性能基准测试不达标，下月限制为最多2个交易对"
+    action: "设置交易对白名单为BTCUSDT和ETHUSDT"
+    severity: WARNING
+
+  KUN-SYS-I001:
+    description: "系统健康度评分恢复至80分以上，退出降级状态"
+    action: "无"
+    severity: INFO
+
+  KUN-SYS-I002:
+    description: "代码质量门禁全部通过，提交成功"
+    action: "无"
+    severity: INFO
