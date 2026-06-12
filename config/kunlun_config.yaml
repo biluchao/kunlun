@@ -1,0 +1,507 @@
+# =============================================================================
+# 昆仑系统 (Kunlun v3.0 "Qilin") · 全局运行配置
+# 环境: 阿里云香港 4核8G | 无GPU | 阿里云KMS + DuckDB
+# 所有时间单位均为秒，价格单位为 USDT，百分比以小数表示
+# =============================================================================
+
+system:
+  name: "Kunlun"
+  version: "3.0.0"
+  environment: "production"          # production / staging / development
+  log_level: "INFO"                  # DEBUG, INFO, WARNING, ERROR
+  # 静默学习时段 (北京时间)
+  silence_learning:
+    enabled: true
+    start_hour: 0                    # 00:00
+    end_hour: 2                      # 02:00
+    # 在此期间: 停止实时交易信号，仅保留持仓监控和风控，进行模型训练、因子评估、策略回测
+  # 月度性能基准测试
+  monthly_benchmark:
+    enabled: true
+    day_of_month: 1                  # 每月1日
+    test_hour: 2                     # 凌晨2点
+    min_trading_pairs_if_fail: 2     # 性能不达标时最大交易对数量
+
+trading:
+  # 交易对列表 (按优先级排序)
+  pairs:
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+    - BNBUSDT
+  max_active_pairs: 4                # 最大同时交易对数量 (受性能测试影响)
+  primary_timeframe: "3m"            # 主周期
+  auxiliary_timeframes: ["5m", "15m", "1h"]
+  initial_aum: 1000000               # 初始资产管理规模 (USDT)，演示用，可扩展至万亿
+  max_aum_capacity: 1000000000000    # 1e12 USDT 容量上限
+
+# -----------------------------------------------------------------------------
+# 市场状态识别 (Polaris Hall)
+# -----------------------------------------------------------------------------
+market_regime:
+  volatility:
+    window_size: 1440                # 计算波动率分位数的K线数量 (3m * 1440 = 3天)
+    percentile_low: 0.25             # 低波动阈值
+    percentile_high: 0.75            # 高波动阈值
+  volume_profile:
+    window_size: 480                 # 1天3分钟K线数量
+    low_threshold: 0.7               # 低于均值的70%为缩量
+    high_threshold: 1.5              # 高于均值的150%为放量
+  hmm:
+    n_states: 2                      # 隐状态数: 0=震荡, 1=趋势
+    n_features: 4                    # [return, volume_change, obi, spread]
+    covariance_type: "full"
+    smoothing_window: 5              # 状态概率EMA平滑窗口
+    min_stability_bars: 3            # 连续3根K线保持新状态才确认切换
+    confirmation_required: true      # 需要双时间尺度 (3m+5m) 同时确认
+    online_retrain_bars: 200         # 每200根K线重估计参数
+    em_max_iter: 100
+    em_convergence: 1e-4
+    regularization: 1e-6             # 协方差矩阵正则化
+  hysteresis:
+    volatility_percentile_hysteresis: 10   # 切换需15%分位数变化
+    volume_zscore_hysteresis: 0.5          # 切换需0.5σ变化
+    confirmation_bars: 3                   # 新状态需持续3根K线确认
+  silence_protocol:
+    ws_disconnect_timeout: 5               # WebSocket断开多久触发安静模式 (秒)
+    rest_error_threshold: 10               # REST连续错误次数
+    price_stale_timeout: 2                 # 价格无更新多久视为冻结 (秒)
+    quiet_mode_observation: 60             # 退出安静模式后的观察期 (秒)
+  liquidity_clock:
+    history_window_days: 30
+    low_liquidity_percentile: 20           # 分位数低于20%视为低流动性时段
+    low_liquidity_size_multiplier: 0.3     # 仓位降至正常30%
+    low_liquidity_allowed_pairs: ["BTCUSDT", "ETHUSDT"]  # 仅允许主流
+
+# -----------------------------------------------------------------------------
+# 因子计算引擎 (Strategos Hall)
+# -----------------------------------------------------------------------------
+factors:
+  # 全局设置
+  update_interval_ms: 100                  # 因子计算周期
+  degradation_interval_ms: 200             # 降级模式下的计算周期
+  normalization_method: "robust_zscore"    # 使用中位数和MAD的抗离群值标准化
+  mad_epsilon: 1e-8                        # MAD零值回退
+  # 因子共线性控制
+  vif_threshold: 5.0                       # VIF超过此值触发PCA降维
+  ic_evaluation_window: 20                 # Rank IC评估窗口 (信号数)
+  ic_min_threshold: 0.02                   # IC低于此值因子降权
+  correlation_penalty_threshold: 0.7       # 因子间相关性超此值权重减半
+  # 各因子独立配置
+  f1_trend_strength:
+    enabled: true
+    ma_period: 25
+    atr_period: 14
+    signal_threshold_long: 0.3
+    signal_threshold_short: -0.3
+    normalizer: "tanh"                     # 映射到[-1,1]
+  f2_ma_slope:
+    enabled: true
+    ma_period: 25
+    slope_lookback: 6                      # 6根K线
+    atr_period: 14
+    signal_threshold_long: 0.15
+    signal_threshold_short: -0.15
+    normalizer: "tanh"
+  f3_mtf_resonance:
+    enabled: true
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+    timeframes: ["5m", "15m"]
+    resonance_required: true               # 两个周期MACD柱同向
+    threshold: 0.05
+  f4_orderbook_imbalance:
+    enabled: true
+    depth_levels: 5                        # 降为5档以节省计算
+    ema_period: 3
+    long_threshold: 0.15
+    short_threshold: -0.15
+    min_depth_ratio: 1.2                   # 最低深度/均值要求 (防虚挂单)
+  f5_book_entropy:
+    enabled: true
+    depth_levels: 5
+    long_threshold: 0.7                    # 低熵 (集中)
+    short_threshold: 0.7
+    normalizer: "1 - entropy"              # 转为集中度
+  f6_whale_flow:
+    enabled: true
+    large_trade_threshold: 50000           # USDT
+    ema_period: 12
+    long_threshold: 0.1
+    short_threshold: -0.1
+  f7_volatility_regime:
+    enabled: true
+    short_atr_period: 14
+    long_atr_period: 56
+    optimal_range: [-0.1, 0.3]             # 最优波动率变化范围
+    penalty_outside: 0.5                   # 超出范围得分减半
+  f8_volume_temperature:
+    enabled: true
+    ma_period: 20
+    std_period: 20
+    long_threshold: -0.5                   # 低于此值极度缩量禁止开仓
+    optimal_zone: [0.0, 2.0]
+
+# -----------------------------------------------------------------------------
+# 自适应信号饥渴度 (SignalHungerRegulator)
+# -----------------------------------------------------------------------------
+signal_hunger:
+  initial_level: 0.5
+  bounds: [0.05, 0.95]
+  momentum_decay: 0.7                      # 动量平滑系数
+  base_threshold: 0.6                      # 基础开仓阈值
+  threshold_range: [-0.25, 0.25]           # 饥渴度0→阈值0.85, 饥渴度1→阈值0.35
+  evaluation_window: 30                    # 最近30笔交易
+  min_trades_for_update: 5
+  positive_pnl_threshold: 0.005            # 0.5% 视为盈利
+  negative_pnl_threshold: -0.005
+  win_rate_high: 0.55
+  win_rate_low: 0.35
+  adjustment_positive: 0.02
+  adjustment_consecutive_win: 0.03
+  consecutive_win_count: 3
+  adjustment_negative: -0.05
+  adjustment_consecutive_loss: -0.08
+  consecutive_loss_count: 3
+  no_signal_timeout: 1800                  # 30分钟无信号开始放松
+  no_signal_adjustment_rate: 0.01          # 每小时+0.01
+  volatility_cap:                          # 波动率对饥渴度的约束
+    high_vol_percentile: 0.8               # >80%分位时 cap=0.4
+    extreme_vol_percentile: 0.9            # >90%分位时 cap=0.25
+  drawdown_lock:                           # 回撤强制保守
+    max_dd_threshold: 0.10                 # 10%回撤
+    max_hunger_at_dd: 0.20
+  agent_override:                          # Stone智能体可覆盖饥渴度
+    stone_fear_multiplier: true            # effective = hunger * (1 - fear_index)
+
+# -----------------------------------------------------------------------------
+# 订单执行与滑点 (Hermes Hall)
+# -----------------------------------------------------------------------------
+execution:
+  # 算法选择
+  impact_thresholds:
+    direct_limit_bps: 1.0                  # <1bp直接限价
+    twap_bps: 5.0                          # 1-5bp用TWAP
+    iceberg_bps: 10.0                      # 5-10bp用冰山
+  twap:
+    default_duration: 30                   # 秒
+    slices: 10
+    random_variance: 0.2                   # 时间随机化±20%
+    emergency_fallback: "market"           # 执行不完切换市价
+  iceberg:
+    visible_ratio_min: 0.001
+    visible_ratio_max: 0.01
+    refresh_variance: 0.3
+  pov:
+    target_rate: 0.05                      # 目标占成交量5%
+    max_duration: 300                      # 最大5分钟
+  fill_rate_check:
+    interval: 5                            # 每5秒检查
+    min_fill_rate: 0.6                     # 60%目标
+    timeout: 30                            # 30秒不达标切换算法
+    confirmation_checks: 2                 # 连续2次不达标才切换
+  order_timeout:
+    entry_limit_ms: 5000                   # 进场限价单超时5秒
+    max_retries: 3
+  # 滑点模型
+  slippage_model:
+    eta: 0.142                             # 永久冲击系数
+    gamma: 0.0378                          # 临时冲击系数
+    delta: 0.5                             # 非线性指数
+    sigma_daily: 0.02                      # 日波动率基准
+    calibration_window: 100                # 最近100笔实盘交易校准
+    learning_rate: 0.005
+    gradient_clip: 1.0                     # 梯度截断
+    parameter_bounds:
+      eta: [0.01, 0.5]
+      gamma: [0.001, 0.1]
+    uncertainty_threshold: 15              # 区间宽度>15bps时强制保守算法
+  # API限速 (币安标准: 1200/分钟请求权重, 50/10秒订单)
+  rate_limit:
+    requests_per_minute: 1200
+    orders_per_10_seconds: 50
+    burst_multiplier: 1.2
+    priority_queue:
+      cancel_order: 0
+      stop_loss: 1
+      new_order: 2
+      query: 3
+
+# -----------------------------------------------------------------------------
+# 持仓与风险管理
+# -----------------------------------------------------------------------------
+risk_management:
+  position_sizing:
+    risk_budget_per_trade: 0.003           # AUM的0.3%
+    max_position_per_asset: 0.03           # 单一标的 <= AUM的3%
+    max_total_exposure: 0.30               # 总敞口 <= 30%
+    max_kelly_fraction: 0.25               # 凯利分数上限
+    min_notional: 100                      # 最小名义价值 (USDT)
+    max_notional: 5000000                  # 单笔上限 (USDT)
+  stop_loss:
+    initial_atr_multiplier: 2.0            # 入场价 ± 2*ATR
+    trailing:
+      tighten_levels:
+        - profit_atr: 3.0                  # 盈利达3倍ATR
+          new_multiplier: 1.5
+        - profit_atr: 5.0                  # 盈利达5倍ATR
+          new_multiplier: 1.0
+      breakeven_trigger_atr: 4.0           # 4倍ATR后移动至保本
+      breakeven_buffer_bps: 5              # 保本缓冲点差
+    update_min_price_change_bps: 10        # 价格变动10bps才更新止损
+    update_min_interval_ms: 500
+  add_position:
+    trigger_atr_multiple: 1.5              # 每盈利1.5倍ATR触发加仓机会
+    max_add_count: 6
+    base_coefficient: 0.8
+    trend_strength_mult_range: [0.3, 2.0]  # 趋势强度乘数范围
+    volume_mult_range: [0.5, 1.5]
+    pre_add_validation:
+      min_trend_duration_bars: 3
+      obi_min: 0.1
+      volume_divergence_max: 0.7           # 成交量不低于前高70%
+    reentry_cooldown_bars: 5               # 二次进场冷却
+    reentry_max_position_ratio: 0.5
+  momentum_decay:
+    detection:
+      volume_decline_bars: 3
+      volume_threshold: 1.0                # 低于MA20
+      distance_convergence_bars: 2
+      rsi_period: 7
+      rsi_overbought: 70
+      rsi_oversold: 30
+    partial_exit:
+      - triggers: 1
+        exit_percent: 0.20
+      - triggers: 2
+        exit_percent: 0.50
+        stop_tighten_mult: 1.5
+      - triggers: 3
+        exit_percent: 0.70
+        stop_tighten_mult: 1.0
+      - triggers: 4
+        exit_percent: 1.00
+  emergency_unwind:
+    orderbook_imbalance_reversal: 0.05     # 5%失衡逆转
+    imbalance_duration_ms: 500             # 必须持续500ms
+    price_penetration_of_stop: 0.5         # 穿透止损50%
+    volume_confirmation_mult: 3.0          # 需大于过去5分钟均量3倍
+    cross_market_btc_drop: 0.03            # BTC 3%跌幅触发联动减仓
+    slippage_limit_bps: 50                 # 紧急市价单最大滑点
+    post_emergency_cooldown: 600           # 10分钟内禁止开仓
+  circuit_breaker:
+    single_trade:
+      max_loss_percent: 0.02
+      max_slippage_percent: 0.005
+      cooldown_seconds: 60
+    strategy_level:
+      max_drawdown: 0.05
+      max_consecutive_losses: 5
+      recovery_hours: 6
+    asset_level:
+      max_daily_loss: 0.03                 # 单日单一资产最大亏损
+      max_position_concentration: 0.15
+    system_level:
+      max_daily_drawdown: 0.05             # 触发后仅平仓
+      max_weekly_drawdown: 0.10            # 暂停所有策略
+      max_total_drawdown: 0.20
+    exchange_level:
+      maintenance_detected: "pause_all"
+      abnormal_latency: "reduce_exposure"
+
+# -----------------------------------------------------------------------------
+# 智能体配置 (五大守护神兽)
+# -----------------------------------------------------------------------------
+agents:
+  stone:
+    name: "Stone Guardian"
+    worldview: "市场永远在酝酿陷阱，生存优先"
+    fear_index:
+      drawdown_weight: 0.4
+      consecutive_loss_weight: 0.3
+      volatility_weight: 0.3
+      ema_smoothing: 0.3
+      thresholds:
+        calm: 0.3
+        cautious: 0.5
+        fearful: 0.7
+        terrified: 0.85
+    veto:
+      calm: "no_veto"
+      cautious: "reduce_position_30%"
+      fearful: "block_new_orders"
+      terrified: "reduce_50%_block_all"
+    adaptation_rate: 0.01                 # 极慢适应
+    min_good_trades_to_relax: 50
+    decay_per_100_profitable: 0.10        # 每100笔盈利恐惧衰减10%
+
+  wind:
+    name: "Wind Seeker"
+    worldview: "机会在怀疑中诞生，波动是朋友"
+    exploration:
+      trigger_no_signal_seconds: 1200
+      factor_threshold_relaxation: 0.20
+      position_ratio: 0.20                # 正常仓位的20%
+      max_total_exploration: 0.05
+      cooldown: 600
+    courage_counter:
+      initial: 10
+      gain_per_win: 1
+      loss_per_loss: -2
+      max: 20
+      min: 0
+      position_multiplier_map: {0: 0.05, 10: 0.20, 20: 0.50}
+
+  mirror:
+    name: "Mirror Auditor"
+    worldview: "模型总是错的，必须不断用实盘校正"
+    reality_gap:
+      metrics: ["slippage", "fill_rate", "latency"]
+      alert_threshold: 0.10
+      critical_threshold: 0.20
+      window_size: 50
+      force_assessment_hours: 4           # 每4小时强制评估
+    calibration:
+      method: "online_sgd"
+      learning_rate: 0.005
+      batch_size: 10
+    factor_reweighting:
+      interval_trades: 100
+      min_improvement: 0.05
+      max_single_adjustment: 0.1
+    strategy_decay:
+      historical_sharpe: 1.5
+      decay_threshold: 0.5                # 实盘低于回测50%视为失效
+
+  eye:
+    name: "Eye Sentinel"
+    worldview: "所有市场都是联动的，结构重于信号"
+    correlation:
+      assets: ["BTC", "ETH", "SOL", "BNB"]
+      traditional: ["SPX", "GLD", "DXY"]
+      window: 100
+      alert_threshold: 0.7
+    cross_market_risk:
+      btc_crash_threshold: 0.03
+      reduce_exposure_pct: 0.50
+      reaction_time_ms: 100
+    state_challenge:
+      confidence_reduction: 0.3
+      require_confirmation: true
+
+  book:
+    name: "Book Chronicler"
+    worldview: "过去虽不重复，但韵律永存"
+    memory:
+      clustering: "kmeans"
+      n_clusters: 20
+      features: ["volatility_percentile", "volume_zscore", "hmm_state", "obi", "trend_mean"]
+      max_memories: 10000
+      similarity_metric: "euclidean"
+    retrieval:
+      top_k: 5
+      min_similarity: 0.6
+      recency_decay: 0.95
+    recommendation:
+      min_win_rate_for_confidence: 0.45
+      action_low_confidence: "reduce_position_50%"
+    introspection:
+      generate_daily: true
+      generate_weekly: true
+
+# -----------------------------------------------------------------------------
+# AI 与沙箱 (Xuanpu Vault)
+# -----------------------------------------------------------------------------
+ai:
+  deepseek:
+    model_path: "./models/deepseek-1.3b-int8"
+    quantization: "int8"
+    load_on_demand: true                  # 按需唤醒
+    memory_threshold: 3.5                 # 可用内存需 >3.5GB 才加载 (GB)
+    load_timeout_seconds: 20
+    inference_timeout_seconds: 30
+    unload_on_memory_pressure: true       # Lv2降级时卸载
+    rule_engine_fallback: true
+    model_registry:
+      keep_versions: 2
+      retention_days: 30
+      promotion_threshold: 0.05           # 新模型需优于旧模型5%
+  openclaw:
+    sandbox_type: "minijail"              # 进程级沙箱
+    memory_limit_mb: 512
+    cpu_limit: 1.0
+    timeout_seconds: 60
+    allowed_modules: ["numpy", "pandas", "scipy"]
+    execution_policy: "serial"            # 单进程串行
+    shadow_mode: "daily_replay"           # 在静默期重放昨日数据
+
+# -----------------------------------------------------------------------------
+# 基础设施
+# -----------------------------------------------------------------------------
+infrastructure:
+  database:
+    engine: "duckdb"
+    path: "./data/kunlun.duckdb"
+    write_lock_timeout_ms: 5000
+    wal_mode: "WRITE_AHEAD_LOG"
+    tick_retention_days: 7
+    kline_retention: "permanent"
+  archive:
+    provider: "aliyun_oss"
+    bucket: "kunlun-archive"
+    region: "cn-hongkong"
+    tick_archive_days: 7                  # 超过此天数的tick上传并本地删除
+    retry_max: 3
+    retry_backoff: [1, 2, 4]
+  health_pulse:
+    update_interval_seconds: 10
+    thresholds:
+      healthy: 80
+      warning: 60
+      critical: 40
+    weights:
+      data: 25
+      execution: 25
+      strategy: 20
+      resource: 15
+      agent: 15
+    auto_degradation: true
+  graceful_degradation:
+    levels:
+      1:
+        cpu_threshold: 0.70
+        memory_threshold: 0.80
+        actions: ["pause_openclaw", "deepseek_diagnostic_only", "factor_update_200ms"]
+      2:
+        cpu_threshold: 0.85
+        memory_threshold: 0.90
+        actions: ["reduce_factors_to_4", "pause_hmm_retrain", "halve_active_pairs"]
+      3:
+        cpu_threshold: 0.95
+        memory_threshold: 0.95
+        actions: ["close_only", "suspend_all_aux"]
+    recovery_check_seconds: 300
+    stability_required_checks: 2          # 连续2次正常才恢复
+
+# -----------------------------------------------------------------------------
+# 安全
+# -----------------------------------------------------------------------------
+security:
+  auth:
+    totp_step_seconds: 30
+    sms_timeout_seconds: 60
+    sms_retry: 1
+    max_failed_attempts: 3
+    lockout_minutes: 15
+    session_timeout_minutes: 30
+  key_management:
+    shamir_shards: 5
+    shamir_threshold: 3
+    emergency_key_shards: 2
+    api_key_rotation_days: 90
+  audit:
+    storage: "duckdb + aliyun_oss_immutable"
+    flush_interval_seconds: 5
+    batch_size: 100
+    retain_days: 365
